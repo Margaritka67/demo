@@ -10,7 +10,11 @@ from mwclient.errors import (
     APIError,
     InvalidResponse,
     MaximumRetriesExceeded,
+    LoginError,
+    ProtectedPageError,
+    InsufficientPermission,
 )
+
 from openai import OpenAI
 
 
@@ -86,10 +90,11 @@ def build_prompt(wikitext: str, title: str) -> str:
     return (
         "Ты — редактор статей. Возьми информацию из большой сложной статьи и сократи её, "
         "сделав понятной школьнику 8–9 класса. Сохраняй важные факты, даты, определения. "
-        "Пиши в вики-формате (заголовки ==, списки *, ссылки [[Название|текст]] где уместно). "
+        f"Дай ссылку на исходную статью в формате {{{{основная статья|{title}}}}}. "
+        "Пиши в wiki-формате (ориентируйся на исходную статью). Для жирного текста используй '''тут текст'''. "
         "В ответ дай только саму статью без дополнительных комментариев. "
-        f"\n\n== Исходная статья: {title} ==\n"
-        f"{wt}\n\n== Статья для школьника ==\n"
+        f"\n\nИсходная статья: {title}:\n"
+        f"{wt}\n\nСтатья для школьника:\n"
     )
 
 def run_summarization(
@@ -138,6 +143,64 @@ def run_summarization(
         raise OpenAIError(e)
 
 
+def publish_draft(
+    content: str,
+    article_title: str,
+    wiki_host: str = "ru.ruwiki.ru",
+    wiki_path: str = "/w/",
+    username: str | None = None,
+    password: str | None = None,
+    summary: str = "Публикация черновика автоматически (бот)",
+    minor: bool = False,
+    overwrite: bool = True,
+) -> str:
+    """
+    Публикует `content` на страницу:
+    Участник:<username>/Черновик/<article_title>
+    Возвращает нормализованное имя созданной/обновлённой страницы.
+    """
+
+    username = username or os.getenv("WIKI_USERNAME")
+    password = password or os.getenv("WIKI_PASSWORD")
+    if not username or not password:
+        raise RuntimeError("Не заданы креды: WIKI_USERNAME / WIKI_PASSWORD")
+
+    site = mwclient.Site(
+        host=(wiki_host if "://" not in wiki_host else wiki_host.split("://", 1)[1]),
+        path=wiki_path,
+        scheme="https",
+        clients_useragent=f"wiki-summarizer-bot/1.0 ({username})"
+    )
+
+    try:
+        site.login(username, password)
+    except (LoginError, APIError, HTTPError) as e:
+        raise RuntimeError(f"Логин не удался: {e}")
+
+    # Страница вида "Участник:Логин/Черновик/<название статьи>"
+    page_title = f"Участник:{username}/Черновик/{article_title}"
+    page = site.pages[page_title]
+
+    # Опции сохранения
+    save_kwargs = {"summary": summary, "minor": minor}
+    if not overwrite:
+        save_kwargs["createonly"] = True
+
+    try:
+        page.save(text=content, **save_kwargs)
+        return page.name
+    except ProtectedPageError as e:
+        raise RuntimeError(f"Страница защищена от записи: {e}")
+    except InsufficientPermission as e:
+        raise RuntimeError(f"Недостаточно прав для правки: {e}")
+    except APIError as e:
+        code = getattr(e, "code", "")
+        if code and "captcha" in code.lower():
+            raise RuntimeError("Правка требует CAPTCHA (используйте бот-пароль с правом edit/skipcaptcha).")
+        raise RuntimeError(f"Ошибка API при сохранении: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Не удалось сохранить страницу: {e}")
+
 def main():
     parser = argparse.ArgumentParser(description="Суммаризация статьи MediaWiki через OpenAI")
     parser.add_argument("title", help="Название статьи (например, 'Изотопы')")
@@ -147,8 +210,20 @@ def main():
     args = parser.parse_args()
 
     try:
-        result = run_summarization(args.title, args.site, args.path, args.model)
-        print(result)
+        summary_text = run_summarization(args.title, args.site, args.path, args.model)
+        print(summary_text)
+
+        """page_name = publish_draft(
+            content=summary_text,
+            article_title=f"{args.title}_draft",
+            wiki_host=args.site,
+            wiki_path=args.path,
+            username="my_user",
+            password="py_password",
+            summary=f"Публикация черновика для «{args.title}_draft»",
+            overwrite=True,
+        )"""
+        
     except PageNotFoundError as e:
         print(f"❌ {e}")
         sys.exit(3)
