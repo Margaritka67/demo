@@ -1,0 +1,5 @@
+openai
+mwclient
+requests
+fastapi
+uvicorn
